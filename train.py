@@ -1,149 +1,99 @@
 import torch
-import torch.optim as optim
-import argparse
-import numpy as np
-from tqdm import tqdm
-from model import DGRACL, contrastive_loss
-from utils import evaluate, augment_sequence, inject_anomalies
+import torch.nn as nn
+import torch.nn.functional as F
 
-def train_epoch(model, train_loader, optimizer, args):
-    """Train for one epoch"""
-    model.train()
-    total_loss = 0
-    
-    for batch in tqdm(train_loader, desc="Training"):
-        sequences, timestamps = batch
-        sequences = sequences.to(args.device)
-        timestamps = timestamps.to(args.device)
-        
-        # Encode sequences
-        embeddings = model.encode_sequence(sequences)
-        
-        # Time-aware contrastive loss
-        batch_size = embeddings.size(0)
-        time_sim = model.time_aware_similarity(
-            embeddings, embeddings, timestamps, timestamps, args.lambda_time
+class SequenceEncoder(nn.Module):
+    """Sequence encoder for temporal graph sequences"""
+    def __init__(self, vocab_size, hidden_dim, num_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, batch_first=True),
+            num_layers=num_layers
         )
+        self.output_layer = nn.Linear(hidden_dim, hidden_dim)
         
-        # Create positive pairs (same sequence)
-        loss_tcl = 0
-        for i in range(batch_size):
-            positive = embeddings[i]
-            negatives = torch.cat([embeddings[:i], embeddings[i+1:]], dim=0)
-            loss_tcl += contrastive_loss(embeddings[i], positive, negatives, args.tau)
-        loss_tcl /= batch_size
-        
-        # Context-aware contrastive loss
-        loss_ccl = 0
-        for seq in sequences:
-            masked, cropped = augment_sequence(seq, args.mask_ratio, args.crop_ratio)
-            emb_masked = model.encode_sequence(masked.unsqueeze(0))
-            emb_cropped = model.encode_sequence(cropped.unsqueeze(0))
-            
-            negatives = embeddings[torch.randperm(batch_size)[:batch_size-1]]
-            loss_ccl += contrastive_loss(emb_masked, emb_cropped, negatives, args.tau)
-        loss_ccl /= batch_size
-        
-        # Total loss
-        loss = loss_tcl + args.alpha * loss_ccl
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    return total_loss / len(train_loader)
+    def forward(self, x):
+        # x: [batch, seq_len]
+        emb = self.embedding(x)  # [batch, seq_len, hidden_dim]
+        out = self.transformer(emb)  # [batch, seq_len, hidden_dim]
+        return self.output_layer(out.mean(dim=1))  # [batch, hidden_dim]
 
-def test(model, test_loader, pool_embeddings, pool_timestamps, args):
-    """Test anomaly detection"""
-    model.eval()
-    all_scores = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing"):
-            sequences, timestamps, labels = batch
-            sequences = sequences.to(args.device)
-            timestamps = timestamps.to(args.device)
-            
-            # Encode query
-            query_emb = model.encode_sequence(sequences)
-            
-            # Retrieve top-K demonstrations
-            retrieved_indices = model.retrieve_demonstrations(
-                query_emb, timestamps, pool_embeddings, pool_timestamps, args.lambda_time
-            )
-            
-            # Fuse retrieved demonstrations
-            for i in range(len(query_emb)):
-                retrieved_embs = pool_embeddings[retrieved_indices[i]]
-                fused_baseline = model.fuse_demonstrations(retrieved_embs)
-                
-                # Compute anomaly score
-                score = model.compute_anomaly_score(query_emb[i], fused_baseline)
-                all_scores.append(score.item())
-                all_labels.append(labels[i].item())
-    
-    # Evaluate
-    results = evaluate(np.array(all_scores), np.array(all_labels))
-    return results
+class CrossAttentionFusion(nn.Module):
+    """Cross-attention for fusing retrieved demonstrations"""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.scale = hidden_dim ** -0.5
+        
+    def forward(self, query, keys, values):
+        """
+        query: [hidden_dim] - query embedding
+        keys: [K, hidden_dim] - retrieved demonstration embeddings
+        values: [K, hidden_dim] - same as keys
+        """
+        # Compute attention scores
+        query = query.unsqueeze(0)  # [1, hidden_dim]
+        attn_scores = torch.matmul(query, keys.T) * self.scale  # [1, K]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [1, K]
+        
+        # Weighted sum of values
+        fused = torch.matmul(attn_weights, values)  # [1, hidden_dim]
+        return fused.squeeze(0)  # [hidden_dim]
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='UCI')
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--num_layers', type=int, default=6)
-    parser.add_argument('--K', type=int, default=7)
-    parser.add_argument('--lambda_time', type=float, default=0.0001)
-    parser.add_argument('--alpha', type=float, default=0.4)
-    parser.add_argument('--tau', type=float, default=0.1)
-    parser.add_argument('--mask_ratio', type=float, default=0.6)
-    parser.add_argument('--crop_ratio', type=float, default=0.8)
-    args = parser.parse_args()
+class DGRACL(nn.Module):
+    """Main DGRA-CL model"""
+    def __init__(self, vocab_size, hidden_dim=256, num_layers=6, K=7):
+        super().__init__()
+        self.encoder = SequenceEncoder(vocab_size, hidden_dim, num_layers)
+        self.attention_fusion = CrossAttentionFusion(hidden_dim)
+        self.K = K
+        self.hidden_dim = hidden_dim
+        
+    def encode_sequence(self, x):
+        """Encode a sequence to embedding"""
+        return self.encoder(x)
     
-    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def time_aware_similarity(self, query_emb, candidate_emb, query_time, candidate_time, lambda_decay):
+        """Compute time-decayed similarity"""
+        # Cosine similarity
+        sim = F.cosine_similarity(query_emb.unsqueeze(1), candidate_emb.unsqueeze(0), dim=-1)
+        # Time decay
+        time_diff = torch.abs(query_time.unsqueeze(1) - candidate_time.unsqueeze(0))
+        time_weight = torch.exp(-lambda_decay * time_diff)
+        return sim * time_weight
     
-    # Load data (simplified - you need to implement actual data loading)
-    print(f"Loading {args.dataset} dataset...")
-    # train_loader, test_loader, vocab_size = load_data(args.dataset)
+    def retrieve_demonstrations(self, query_emb, query_time, pool_emb, pool_time, lambda_decay):
+        """Retrieve top-K similar normal patterns"""
+        similarities = self.time_aware_similarity(query_emb, pool_emb, query_time, pool_time, lambda_decay)
+        top_k_indices = torch.topk(similarities, self.K, dim=1).indices
+        return top_k_indices
     
-    # Initialize model
-    model = DGRACL(vocab_size=10000, hidden_dim=args.hidden_dim, 
-                   num_layers=args.num_layers, K=args.K).to(args.device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    def fuse_demonstrations(self, query_emb, retrieved_embs):
+        """Fuse retrieved demonstrations using cross-attention"""
+        return self.attention_fusion(query_emb, retrieved_embs, retrieved_embs)
     
-    # Train
-    print("Training DGRA-CL...")
-    for epoch in range(args.epochs):
-        loss = train_epoch(model, train_loader, optimizer, args)
-        print(f"Epoch {epoch+1}/{args.epochs}, Loss: {loss:.4f}")
-    
-    # Build normal pattern pool
-    print("Building normal pattern pool...")
-    pool_embeddings = []
-    pool_timestamps = []
-    with torch.no_grad():
-        for batch in train_loader:
-            sequences, timestamps = batch
-            emb = model.encode_sequence(sequences.to(args.device))
-            pool_embeddings.append(emb)
-            pool_timestamps.append(timestamps)
-    pool_embeddings = torch.cat(pool_embeddings, dim=0)
-    pool_timestamps = torch.cat(pool_timestamps, dim=0)
-    
-    # Test
-    print("Testing...")
-    results = test(model, test_loader, pool_embeddings, pool_timestamps, args)
-    
-    print("\nResults:")
-    print(f"AUC-ROC: {results['AUC']:.4f}")
-    print(f"F1-Score: {results['F1']:.4f}")
-    print(f"Precision: {results['Precision']:.4f}")
-    print(f"Recall: {results['Recall']:.4f}")
+    def compute_anomaly_score(self, query_emb, fused_baseline, alpha=0.6, beta=0.4):
+        """Compute anomaly score"""
+        # Cosine distance
+        cos_dist = 1 - F.cosine_similarity(query_emb, fused_baseline, dim=0)
+        # Euclidean distance
+        l2_dist = torch.norm(query_emb - fused_baseline, p=2)
+        return alpha * cos_dist + beta * l2_dist
 
-if __name__ == "__main__":
-    main()
+def contrastive_loss(query, positive, negatives, temperature=0.1):
+    """Time-aware contrastive loss"""
+    # Normalize
+    query = F.normalize(query, dim=-1)
+    positive = F.normalize(positive, dim=-1)
+    negatives = F.normalize(negatives, dim=-1)
+    
+    # Positive similarity
+    pos_sim = torch.exp(torch.sum(query * positive, dim=-1) / temperature)
+    
+    # Negative similarities
+    neg_sim = torch.exp(torch.matmul(query, negatives.T) / temperature).sum(dim=-1)
+    
+    # Loss
+    loss = -torch.log(pos_sim / (pos_sim + neg_sim))
+    return loss.mean()
