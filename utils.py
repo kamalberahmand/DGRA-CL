@@ -3,28 +3,46 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
 
 def inject_anomalies(edges, timestamps, nodes, anomaly_ratio=0.15):
-    """Inject synthetic anomalies into test set"""
+    """Inject realistic anomalies into test set"""
     num_anomalies = int(len(edges) * anomaly_ratio)
     anomaly_indices = np.random.choice(len(edges), num_anomalies, replace=False)
     
     labels = np.zeros(len(edges))
     labels[anomaly_indices] = 1
     
-    # Structural anomalies: rewire edges
-    structural_idx = anomaly_indices[:num_anomalies//3]
-    for idx in structural_idx:
-        edges[idx] = (np.random.choice(nodes), np.random.choice(nodes))
+    # Degree bursts: sudden increases in node connectivity
+    degree_burst_idx = anomaly_indices[:num_anomalies//3]
+    avg_degree = len(edges) / len(nodes)
+    burst_multiplier = np.random.uniform(5, 10)  # 5-10x increase
+    for idx in degree_burst_idx:
+        target_node = edges[idx][0]
+        num_new_edges = int(avg_degree * burst_multiplier)
+        # Add multiple edges from this node
+        for _ in range(num_new_edges):
+            random_target = np.random.choice(nodes)
+            if idx + 1 < len(edges):
+                edges = np.insert(edges, idx + 1, [target_node, random_target], axis=0)
+                timestamps = np.insert(timestamps, idx + 1, timestamps[idx])
     
-    # Temporal anomalies: shift timestamps
-    temporal_idx = anomaly_indices[num_anomalies//3:2*num_anomalies//3]
+    # Clique injection: densely connected subgraphs
+    clique_idx = anomaly_indices[num_anomalies//3:2*num_anomalies//3]
+    clique_size = np.random.randint(3, 6)  # 3-5 nodes
+    for idx in clique_idx:
+        clique_nodes = np.random.choice(nodes, clique_size, replace=False)
+        # Create dense connections (90% edge density)
+        for i in range(clique_size):
+            for j in range(i+1, clique_size):
+                if np.random.random() < 0.9:  # 90% density
+                    edges[idx] = (clique_nodes[i], clique_nodes[j])
+    
+    # Temporal shifts: timing anomalies (2σ deviation)
+    temporal_idx = anomaly_indices[2*num_anomalies//3:]
+    mean_time = np.mean(timestamps)
+    std_time = np.std(timestamps)
     for idx in temporal_idx:
-        timestamps[idx] *= np.random.uniform(0.5, 1.5)
-    
-    # Contextual anomalies: substitute with low-frequency nodes
-    contextual_idx = anomaly_indices[2*num_anomalies//3:]
-    rare_nodes = nodes[:len(nodes)//10]  # Bottom 10%
-    for idx in contextual_idx:
-        edges[idx] = (np.random.choice(rare_nodes), edges[idx][1])
+        # Shift beyond 2 standard deviations
+        shift = np.random.choice([-1, 1]) * np.random.uniform(2, 4) * std_time
+        timestamps[idx] = timestamps[idx] + shift
     
     return edges, timestamps, labels
 
@@ -45,8 +63,8 @@ def evaluate(scores, labels):
             best_thresh = thresh
     
     preds = (scores > best_thresh).astype(int)
-    precision = precision_score(labels, preds)
-    recall = recall_score(labels, preds)
+    precision = precision_score(labels, preds, zero_division=0)
+    recall = recall_score(labels, preds, zero_division=0)
     
     return {
         'AUC': auc,
